@@ -151,7 +151,7 @@ def main():
     )
 
     rngs = nnx.Rngs(0)
-    model = AlexNet5090(num_classes=1000, dtype=jnp.float8_e4m3fn, rngs=rngs)
+    model = AlexNet5090(num_classes=1000, dtype=jnp.bfloat16, rngs=rngs)
     
     # Warmup + Piecewise constant decay schedule
     warmup_steps = (len(dataset) // args.batch_size) * args.warmup_epochs
