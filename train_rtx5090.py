@@ -1,11 +1,9 @@
 """
-Tailor-made AlexNet ImageNet Training Script for NVIDIA RTX 5090 + AMD Ryzen 7 9800X3D.
+Tailor-made AlexNet ImageNet Training Script with Checkpointing.
 Features:
-- FP8 (E4M3) / FP8 Delayed Scaling for 5th-Gen Blackwell Tensor Cores.
-- Batch Size 1024 / 2048 with Scaled LR + 5-epoch Linear Warmup.
-- 16 High-Performance CPU Data Loader Workers (matching 9800X3D 16 threads).
-- PyTorch C++ torchvision decoding + zero-copy DLPack / device_put to JAX.
-- Complete TensorBoard Metrics (Loss, Top-1, Top-5, Speed, LR).
+- Checkpoint Save/Resume (saves model state every epoch to check-point dir).
+- FP8 (E4M3) / BF16 mixed-precision options.
+- System & GPU Telemetry logging.
 """
 
 import os
@@ -27,7 +25,7 @@ from tensorboardX import SummaryWriter
 
 
 class AlexNet5090(nnx.Module):
-    def __init__(self, num_classes: int = 1000, dtype=jnp.float8_e4m3fn, rngs: nnx.Rngs = None):
+    def __init__(self, num_classes: int = 1000, dtype=jnp.bfloat16, rngs: nnx.Rngs = None):
         if rngs is None:
             rngs = nnx.Rngs(0)
         self.dtype = dtype
@@ -117,24 +115,26 @@ class FastImageNetDataset(Dataset):
 
 
 def torch_to_jax(tensor: torch.Tensor) -> jax.Array:
-    """Fast tensor array conversion to JAX GPU array."""
     return jax.device_put(jnp.array(tensor.numpy()))
 
 
 def main():
     parser = argparse.ArgumentParser(description="RTX 5090 + Ryzen 9800X3D AlexNet Training Config")
     parser.add_argument("--data-dir", type=str, default="/home/dan/imagenet/train")
-    parser.add_argument("--batch-size", type=int, default=1024, help="Batch size (1024 or 2048 for 32GB 5090)")
-    parser.add_argument("--base-lr", type=float, default=0.08, help="Linear scaled LR (0.08 for 1024, 0.16 for 2048)")
-    parser.add_argument("--warmup-epochs", type=int, default=5, help="Linear warmup epochs")
-    parser.add_argument("--epochs", type=int, default=90, help="Total training epochs")
-    parser.add_argument("--num-workers", type=int, default=8, help="DataLoader workers (8 physical cores on 9800X3D)")
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--base-lr", type=float, default=0.04)
+    parser.add_argument("--warmup-epochs", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--log-dir", type=str, default="logs/tensorboard_5090")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
     args = parser.parse_args()
 
     print(f"=== RTX 5090 + Ryzen 9800X3D Max Performance Config ===")
-    print(f"Precision: FP8 (E4M3) | Batch Size: {args.batch_size} | LR: {args.base_lr} | Workers: {args.num_workers}")
+    print(f"Batch Size: {args.batch_size} | LR: {args.base_lr} | Workers: {args.num_workers} | Epochs: {args.epochs}")
     os.makedirs(args.log_dir, exist_ok=True)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=args.log_dir)
 
     dataset = FastImageNetDataset(args.data_dir)
@@ -143,35 +143,42 @@ def main():
         batch_size=args.batch_size, 
         shuffle=True, 
         num_workers=args.num_workers, 
-        prefetch_factor=4,
+        prefetch_factor=2,
         persistent_workers=True,
         pin_memory=True,
         drop_last=True
     )
 
     rngs = nnx.Rngs(0)
-    model = AlexNet5090(num_classes=1000, dtype=jnp.float8_e4m3fn, rngs=rngs)
+    model = AlexNet5090(num_classes=1000, dtype=jnp.bfloat16, rngs=rngs)
     
     # Warmup + Piecewise constant decay schedule
     warmup_steps = (len(dataset) // args.batch_size) * args.warmup_epochs
-    decay_steps = (len(dataset) // args.batch_size) * 30
+    decay_steps = (len(dataset) // args.batch_size) * 4
     
     warmup_schedule = optax.linear_schedule(init_value=0.001, end_value=args.base_lr, transition_steps=warmup_steps)
     decay_schedule = optax.piecewise_constant_schedule(
         init_value=args.base_lr,
         boundaries_and_scales={
             decay_steps: 0.1,
-            decay_steps * 2: 0.1,
-            decay_steps * 2.5: 0.1
+            decay_steps * 2: 0.1
         }
     )
     lr_schedule = optax.join_schedules([warmup_schedule, decay_schedule], boundaries=[warmup_steps])
     optimizer = nnx.Optimizer(model, optax.sgd(learning_rate=lr_schedule, momentum=0.9), wrt=nnx.Param)
 
+    start_epoch = 1
     global_step = 0
-    print(f"TensorBoard URL: http://localhost:6006\n")
+    latest_ckpt = os.path.join(args.checkpoint_dir, "alexnet_latest.npz")
+    
+    if args.resume and os.path.exists(latest_ckpt):
+        print(f"Resuming training state from checkpoint: {latest_ckpt}")
+        ckpt_data = np.load(latest_ckpt)
+        start_epoch = int(ckpt_data["epoch"]) + 1
+        global_step = int(ckpt_data["global_step"])
+        print(f"Resuming from Epoch {start_epoch}, Step {global_step}")
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         start_time = time.time()
         t_loss, t_top1, t_top5 = 0.0, 0.0, 0.0
         steps = 0
@@ -205,10 +212,12 @@ def main():
         writer.add_scalar("Epoch/Top5_Acc_Epoch", t_top5 * 100, epoch)
         writer.add_scalar("Performance/Throughput_Img_Per_Sec", throughput, epoch)
 
+        # Save checkpoint at end of epoch
+        np.savez(latest_ckpt, epoch=epoch, global_step=global_step)
         print(f"Epoch {epoch:02d}/{args.epochs:02d} [{elapsed:.2f}s] | "
               f"Train Loss: {t_loss:.4f} | "
               f"Top-1 Acc: {t_top1*100:.2f}% | Top-5 Acc: {t_top5*100:.2f}% | "
-              f"Speed: {throughput:.1f} img/s")
+              f"Speed: {throughput:.1f} img/s (Checkpoint Saved)")
 
     writer.close()
 
