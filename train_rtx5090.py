@@ -32,20 +32,19 @@ class AlexNet5090(nnx.Module):
             rngs = nnx.Rngs(0)
         self.dtype = dtype
         
-        self.conv1 = nnx.Conv(in_features=3, out_features=96, kernel_size=(11, 11), strides=(4, 4), padding=((2, 2), (2, 2)), dtype=dtype, rngs=rngs)
-        self.conv2 = nnx.Conv(in_features=96, out_features=256, kernel_size=(5, 5), padding=((2, 2), (2, 2)), dtype=dtype, rngs=rngs)
-        self.conv3 = nnx.Conv(in_features=256, out_features=384, kernel_size=(3, 3), padding=((1, 1), (1, 1)), dtype=dtype, rngs=rngs)
-        self.conv4 = nnx.Conv(in_features=384, out_features=384, kernel_size=(3, 3), padding=((1, 1), (1, 1)), dtype=dtype, rngs=rngs)
-        self.conv5 = nnx.Conv(in_features=384, out_features=256, kernel_size=(3, 3), padding=((1, 1), (1, 1)), dtype=dtype, rngs=rngs)
+        self.conv1 = nnx.Conv(in_features=3, out_features=96, kernel_size=(11, 11), strides=(4, 4), padding=((2, 2), (2, 2)), rngs=rngs)
+        self.conv2 = nnx.Conv(in_features=96, out_features=256, kernel_size=(5, 5), padding=((2, 2), (2, 2)), rngs=rngs)
+        self.conv3 = nnx.Conv(in_features=256, out_features=384, kernel_size=(3, 3), padding=((1, 1), (1, 1)), rngs=rngs)
+        self.conv4 = nnx.Conv(in_features=384, out_features=384, kernel_size=(3, 3), padding=((1, 1), (1, 1)), rngs=rngs)
+        self.conv5 = nnx.Conv(in_features=384, out_features=256, kernel_size=(3, 3), padding=((1, 1), (1, 1)), rngs=rngs)
         
-        self.fc6 = nnx.Linear(in_features=256 * 6 * 6, out_features=4096, dtype=dtype, rngs=rngs)
+        self.fc6 = nnx.Linear(in_features=256 * 6 * 6, out_features=4096, rngs=rngs)
         self.dropout1 = nnx.Dropout(rate=0.5, rngs=rngs)
-        self.fc7 = nnx.Linear(in_features=4096, out_features=4096, dtype=dtype, rngs=rngs)
+        self.fc7 = nnx.Linear(in_features=4096, out_features=4096, rngs=rngs)
         self.dropout2 = nnx.Dropout(rate=0.5, rngs=rngs)
-        self.fc8 = nnx.Linear(in_features=4096, out_features=num_classes, dtype=dtype, rngs=rngs)
+        self.fc8 = nnx.Linear(in_features=4096, out_features=num_classes, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        x = x.astype(jnp.bfloat16)
         x = nnx.relu(self.conv1(x))
         x = nnx.max_pool(x, window_shape=(3, 3), strides=(2, 2))
         x = nnx.relu(self.conv2(x))
@@ -61,7 +60,7 @@ class AlexNet5090(nnx.Module):
         x = nnx.relu(self.fc7(x))
         x = self.dropout2(x)
         x = self.fc8(x)
-        return x.astype(jnp.float32)
+        return x
 
 
 def loss_fn(model: AlexNet5090, batch_x: jax.Array, batch_y: jax.Array):
