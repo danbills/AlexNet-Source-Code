@@ -121,8 +121,8 @@ def torch_to_jax(tensor: torch.Tensor) -> jax.Array:
 def main():
     parser = argparse.ArgumentParser(description="RTX 5090 + Ryzen 9800X3D AlexNet Training Config")
     parser.add_argument("--data-dir", type=str, default="/home/dan/imagenet/train")
-    parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--base-lr", type=float, default=0.04)
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--base-lr", type=float, default=0.08)
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--num-workers", type=int, default=8)
