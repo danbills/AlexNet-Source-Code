@@ -27,7 +27,7 @@ from tensorboardX import SummaryWriter
 
 
 class AlexNet5090(nnx.Module):
-    def __init__(self, num_classes: int = 1000, dtype=jnp.float8_e4m3fn, rngs: nnx.Rngs = None):
+    def __init__(self, num_classes: int = 1000, dtype=jnp.bfloat16, rngs: nnx.Rngs = None):
         if rngs is None:
             rngs = nnx.Rngs(0)
         self.dtype = dtype
