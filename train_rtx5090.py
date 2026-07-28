@@ -45,7 +45,7 @@ class AlexNet5090(nnx.Module):
         self.fc8 = nnx.Linear(in_features=4096, out_features=num_classes, dtype=dtype, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        x = x.astype(self.dtype)
+        x = x.astype(jnp.bfloat16)
         x = nnx.relu(self.conv1(x))
         x = nnx.max_pool(x, window_shape=(3, 3), strides=(2, 2))
         x = nnx.relu(self.conv2(x))
