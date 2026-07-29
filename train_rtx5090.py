@@ -23,6 +23,8 @@ from torchvision.io import read_image, ImageReadMode
 from torch.utils.data import Dataset, DataLoader
 from tensorboardX import SummaryWriter
 
+from dali_pipeline import build_file_label_lists, build_dali_jax_iterator
+
 
 class AlexNet5090(nnx.Module):
     def __init__(self, num_classes: int = 1000, dtype=jnp.bfloat16, rngs: nnx.Rngs = None):
@@ -82,23 +84,13 @@ def train_step(model: AlexNet5090, optimizer: nnx.Optimizer, batch_x: jax.Array,
 
 class FastImageNetDataset(Dataset):
     def __init__(self, root_dir: str):
-        self.image_paths = []
-        self.labels = []
-        
-        dirs = sorted([d for d in glob.glob(os.path.join(root_dir, "n*")) if os.path.isdir(d)])
-        class_to_idx = {os.path.basename(d): i for i, d in enumerate(dirs)}
-        
-        for d in dirs:
-            c_idx = class_to_idx[os.path.basename(d)]
-            for img in glob.glob(os.path.join(d, "*.JPEG")):
-                self.image_paths.append(img)
-                self.labels.append(c_idx)
-                
+        self.image_paths, self.labels, class_to_idx = build_file_label_lists(root_dir)
+
         self.transform = transforms.Compose([
             transforms.Resize((224, 224), antialias=True),
             transforms.ToDtype(torch.float32, scale=True),
         ])
-        print(f"Dataset initialized: {len(dirs)} classes, {len(self.image_paths)} total images.")
+        print(f"Dataset initialized: {len(class_to_idx)} classes, {len(self.image_paths)} total images.")
 
     def __len__(self):
         return len(self.image_paths)
@@ -118,6 +110,50 @@ def torch_to_jax(tensor: torch.Tensor) -> jax.Array:
     return jax.device_put(jnp.array(tensor.numpy()))
 
 
+def _flatten_state(state, prefix):
+    return {
+        f"{prefix}/" + "/".join(str(k) for k in path): np.asarray(leaf)
+        for path, leaf in jax.tree_util.tree_leaves_with_path(state)
+    }
+
+
+def save_checkpoint(path: str, model: AlexNet5090, optimizer: nnx.Optimizer, epoch: int, global_step: int):
+    """Persists model weights and optimizer state (e.g. SGD momentum), not just
+    the epoch/step counters, so --resume actually continues training instead of
+    restarting a freshly-initialized model under an advanced LR schedule.
+
+    Model state is filtered to nnx.Param only, excluding the Dropout layers'
+    RNG-stream variables (a JAX PRNGKey dtype that can't round-trip through
+    np.asarray) — those don't need to survive a resume, dropout masks are
+    stochastic regularization, not state that affects correctness.
+    """
+    flat = {}
+    flat.update(_flatten_state(nnx.state(model, nnx.Param), "model"))
+    flat.update(_flatten_state(nnx.state(optimizer), "opt"))
+    flat["epoch"] = np.asarray(epoch)
+    flat["global_step"] = np.asarray(global_step)
+
+    tmp_path = path + ".tmp.npz"
+    np.savez(tmp_path, **flat)
+    os.replace(tmp_path, path)
+
+
+def load_checkpoint(path: str, model: AlexNet5090, optimizer: nnx.Optimizer) -> tuple[int, int]:
+    data = np.load(path)
+
+    def restore(state, prefix):
+        leaves_with_path = jax.tree_util.tree_leaves_with_path(state)
+        new_leaves = [
+            jnp.asarray(data[f"{prefix}/" + "/".join(str(k) for k in p)])
+            for p, _ in leaves_with_path
+        ]
+        return jax.tree_util.tree_unflatten(jax.tree_util.tree_structure(state), new_leaves)
+
+    nnx.update(model, restore(nnx.state(model, nnx.Param), "model"))
+    nnx.update(optimizer, restore(nnx.state(optimizer), "opt"))
+    return int(data["epoch"]), int(data["global_step"])
+
+
 def main():
     parser = argparse.ArgumentParser(description="RTX 5090 + Ryzen 9800X3D AlexNet Training Config")
     parser.add_argument("--data-dir", type=str, default="/home/dan/imagenet/train")
@@ -126,35 +162,52 @@ def main():
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--data-pipeline", type=str, choices=["torch", "dali"], default="torch",
+                         help="torch: CPU decode via DataLoader workers. dali: GPU decode+resize via nvJPEG/DALI.")
+    parser.add_argument("--num-threads", type=int, default=8, help="DALI pipeline threads (--data-pipeline dali only)")
     parser.add_argument("--log-dir", type=str, default="logs/tensorboard_5090")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
     args = parser.parse_args()
 
     print(f"=== RTX 5090 + Ryzen 9800X3D Max Performance Config ===")
-    print(f"Batch Size: {args.batch_size} | LR: {args.base_lr} | Workers: {args.num_workers} | Epochs: {args.epochs}")
+    print(f"Batch Size: {args.batch_size} | LR: {args.base_lr} | Workers: {args.num_workers} | Epochs: {args.epochs} | Pipeline: {args.data_pipeline}")
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=args.log_dir)
 
-    dataset = FastImageNetDataset(args.data_dir)
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True, 
-        num_workers=args.num_workers, 
-        prefetch_factor=2,
-        persistent_workers=True,
-        pin_memory=True,
-        drop_last=True
-    )
+    if args.data_pipeline == "torch":
+        dataset = FastImageNetDataset(args.data_dir)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            prefetch_factor=2,
+            persistent_workers=True,
+            pin_memory=True,
+            drop_last=True
+        )
+        dataset_size = len(dataset)
+
+        def batch_source():
+            for x, y in dataloader:
+                yield torch_to_jax(x), torch_to_jax(y)
+    else:
+        dali_iterator, dataset_size, _ = build_dali_jax_iterator(
+            args.data_dir, args.batch_size, args.num_threads, args.checkpoint_dir,
+        )
+
+        def batch_source():
+            for batch in dali_iterator:
+                yield batch["images"], batch["labels"].reshape(-1)
 
     rngs = nnx.Rngs(0)
     model = AlexNet5090(num_classes=1000, dtype=jnp.bfloat16, rngs=rngs)
-    
+
     # Warmup + Piecewise constant decay schedule
-    warmup_steps = (len(dataset) // args.batch_size) * args.warmup_epochs
-    decay_steps = (len(dataset) // args.batch_size) * 4
+    warmup_steps = (dataset_size // args.batch_size) * args.warmup_epochs
+    decay_steps = (dataset_size // args.batch_size) * 4
     
     warmup_schedule = optax.linear_schedule(init_value=0.001, end_value=args.base_lr, transition_steps=warmup_steps)
     decay_schedule = optax.piecewise_constant_schedule(
@@ -173,20 +226,16 @@ def main():
     
     if args.resume and os.path.exists(latest_ckpt):
         print(f"Resuming training state from checkpoint: {latest_ckpt}")
-        ckpt_data = np.load(latest_ckpt)
-        start_epoch = int(ckpt_data["epoch"]) + 1
-        global_step = int(ckpt_data["global_step"])
-        print(f"Resuming from Epoch {start_epoch}, Step {global_step}")
+        ckpt_epoch, global_step = load_checkpoint(latest_ckpt, model, optimizer)
+        start_epoch = ckpt_epoch + 1
+        print(f"Resuming from Epoch {start_epoch}, Step {global_step} (model + optimizer state restored)")
 
     for epoch in range(start_epoch, args.epochs + 1):
         start_time = time.time()
         t_loss, t_top1, t_top5 = 0.0, 0.0, 0.0
         steps = 0
 
-        for batch_x_tensor, batch_y_tensor in dataloader:
-            bx = torch_to_jax(batch_x_tensor)
-            by = torch_to_jax(batch_y_tensor)
-            
+        for bx, by in batch_source():
             l, top1, top5 = train_step(model, optimizer, bx, by)
             t_loss += float(l)
             t_top1 += float(top1)
@@ -212,8 +261,8 @@ def main():
         writer.add_scalar("Epoch/Top5_Acc_Epoch", t_top5 * 100, epoch)
         writer.add_scalar("Performance/Throughput_Img_Per_Sec", throughput, epoch)
 
-        # Save checkpoint at end of epoch
-        np.savez(latest_ckpt, epoch=epoch, global_step=global_step)
+        # Save checkpoint (model + optimizer state) at end of epoch
+        save_checkpoint(latest_ckpt, model, optimizer, epoch, global_step)
         print(f"Epoch {epoch:02d}/{args.epochs:02d} [{elapsed:.2f}s] | "
               f"Train Loss: {t_loss:.4f} | "
               f"Top-1 Acc: {t_top1*100:.2f}% | Top-5 Acc: {t_top5*100:.2f}% | "
