@@ -90,12 +90,19 @@ def imagenet_pipeline(files, labels, random_shuffle=True, shuffle_seed=0):
     # Resize(antialias=True); pixel values are not bit-identical (verified in
     # dali_smoke_test.py: means agree to ~1e-2, which is expected of a training
     # pipeline, not a numerically-reproducible one).
-    images = fn.resize(images, resize_x=224, resize_y=224, interp_type=types.INTERP_TRIANGULAR)
-    # mean=0, std=255 => pure /255 scale, matching ToDtype(float32, scale=True).
-    # No mean/std normalization, since the torch pipeline applies none either.
+    images = fn.resize(images, resize_shorter=256, interp_type=types.INTERP_TRIANGULAR)
+    # Must mirror FastImageNetDataset exactly: random 224 crop, random horizontal
+    # flip, and uint8 output. The scale to [0,1] is deliberately NOT applied here
+    # — train_rtx5090.py's loss_fn does it on the GPU for both pipelines, so
+    # normalizing here as well would divide by 255 twice.
     images = fn.crop_mirror_normalize(
-        images, mean=0.0, std=255.0,
-        output_layout="HWC", dtype=types.FLOAT,
+        images,
+        crop=(224, 224),
+        crop_pos_x=fn.random.uniform(range=(0.0, 1.0)),
+        crop_pos_y=fn.random.uniform(range=(0.0, 1.0)),
+        mirror=fn.random.coin_flip(probability=0.5),
+        mean=0.0, std=1.0,
+        output_layout="HWC", dtype=types.UINT8,
     )
     return images, lbls.gpu()
 
